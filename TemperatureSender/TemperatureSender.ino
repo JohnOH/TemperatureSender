@@ -37,7 +37,7 @@ ISR(WDT_vect) { Sleepy::watchdogEvent(); } // interrupt handler for JeeLabs Slee
 #define ONE_WIRE_BUS 10   // DS18B20 Temperature sensor is connected on D10/ATtiny pin 13
 #define ONE_WIRE_POWER 9  // DS18B20 Power pin is connected on D9/ATtiny pin 12
 
-#define BASIC_PAYLOAD_SIZE 9
+#define BASIC_PAYLOAD_SIZE 10
 byte payloadSize = BASIC_PAYLOAD_SIZE;
 byte commandResponse = false;
 
@@ -45,20 +45,20 @@ OneWire ds(ONE_WIRE_BUS); // Setup a oneWire instance
 
 //DallasTemperature sensors(&oneWire); // Pass our oneWire reference to Dallas Temperature
 
-struct payload{
+typedef struct {
       byte command;         // Last command received in ACK
       byte badCRC:  4;      // Running count of CRC mismatches
-      byte setBack: 2;      // True if a setback is pending
-      byte packetType:  2;  // High order packet type bits
+      byte packetType:  4;  // High order packet type bits
       byte attempts: 4;     // transmission attempts
       byte count: 4;        // packet count
       byte goodNoiseFloor;  // Noise floor allowed transmit
       byte failNoiseFloor;  // Noise floor prevention transmit
-      int temp;	            // Temperature reading
-      int supplyV;	        // Supply voltage
+      byte align;
+      unsigned int temp;    // Temperature reading
+      unsigned int supplyV; // Supply voltage
       char messages[64 - BASIC_PAYLOAD_SIZE];
- } payload;
-#define BASIC_PAYLOAD_SIZE 9
+ } packet;
+ static packet payload;
  
 typedef struct {
     byte start;
@@ -69,6 +69,7 @@ typedef struct {
 static eeprom settings;
 
 static byte sendACK() {
+  payload.count++;
   for (byte t = 1; t <= RETRY_LIMIT; t++) {  
       delay(t * t);                   // Increasing the gap between retransmissions
       payload.attempts = t;
@@ -95,6 +96,7 @@ static byte sendACK() {
           }
           // Serial.println();
           if (rf12_buf[2] > 0) {                          // Non-zero length ACK packet?
+              payload.packetType = 1;                         
               payload.command = rf12_buf[3];
               // Serial.print("Command=");
               // Serial.println(rf12_buf[3]);
@@ -127,6 +129,7 @@ static byte sendACK() {
                       }
                       if (rf12_buf[3] > 99 && rf12_buf[3] < 255) {
                           settings.txAllowThreshold = rf12_buf[3];
+                          payload.failNoiseFloor = 0;
                           break;  
                       }
                       // Serial.println("Unknown Command");
@@ -290,8 +293,8 @@ void setup() {
   ds.write(0x80);           // Set T(l)
   ds.write(0x7F);           // Set Config 12 bit
 
-/*  
-/// Copy config to on-chip EEProm, only required on first use of a new DS18B20
+/* Required if a new DS18B20 is installed.
+// Write to DS18B20 eeprom
   ds.reset();
   ds.skip();                // Next command to all devices
   ds.write(0x48);           // Set Config
@@ -306,8 +309,9 @@ unsigned int getTemp(byte* sensor) {
   byte data[12]; 
 
   ds.reset();
-  ds.select(sensor);    
-  ds.write(0xBE);                                            // Request Scratchpad
+  ds.skip();                // Next command to all devices
+//  ds.select(sensor);    
+  ds.write(0xBE);                      // Request Scratchpad
 
   for ( i = 0; i < 9; i++) {           // we need 9 bytes
     data[i] = ds.read();
@@ -324,13 +328,14 @@ unsigned int getTemp(byte* sensor) {
 void loop() {
   
   digitalWrite(ONE_WIRE_POWER, HIGH); // turn DS18B20 sensor on
-  Sleepy::loseSomeTime((50)); 
+  Sleepy::loseSomeTime(50); 
   ds.reset();
   ds.skip();                                                // Next command to all devices
   ds.write(0x44);                                           // Start all temperature conversions.
   Sleepy::loseSomeTime((750));                              // Wait for the data to be available
 
-  payload.temp = getTemp(0);
+  unsigned int temp = getTemp(0);
+  payload.temp = temp;
   digitalWrite(ONE_WIRE_POWER, LOW); // turn DS18B20 off
   
   payload.supplyV = readVcc(); // Get supply voltage
@@ -339,6 +344,7 @@ void loop() {
   if(payload.goodNoiseFloor) sendACK();
   else payload.failNoiseFloor = payload.goodNoiseFloor; 
   
-  Sleepy::loseSomeTime(60000);
+  if(!(commandResponse)) Sleepy::loseSomeTime(60000);
+  else Sleepy::loseSomeTime((1000));
 
 }
