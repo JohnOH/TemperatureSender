@@ -37,7 +37,7 @@ ISR(WDT_vect) { Sleepy::watchdogEvent(); } // interrupt handler for JeeLabs Slee
 #define ONE_WIRE_BUS 10   // DS18B20 Temperature sensor is connected on D10/ATtiny pin 13
 #define ONE_WIRE_POWER 9  // DS18B20 Power pin is connected on D9/ATtiny pin 12
 
-#define BASIC_PAYLOAD_SIZE 10
+#define BASIC_PAYLOAD_SIZE 11
 byte payloadSize = BASIC_PAYLOAD_SIZE;
 byte commandResponse = false;
 
@@ -53,7 +53,8 @@ typedef struct {
       byte count: 4;        // packet count
       byte goodNoiseFloor;  // Noise floor allowed transmit
       byte failNoiseFloor;  // Noise floor prevention transmit
-      byte align;
+      byte failNoiseCount;
+      byte rxRssi;          // RSSI of received ACK's
       unsigned int temp;    // Temperature reading
       unsigned int supplyV; // Supply voltage
       char messages[64 - BASIC_PAYLOAD_SIZE];
@@ -129,7 +130,8 @@ static byte sendACK() {
                       }
                       if (rf12_buf[3] > 99 && rf12_buf[3] < 255) {
                           settings.txAllowThreshold = rf12_buf[3];
-                          payload.failNoiseFloor = 0;
+                          payload.failNoiseFloor = 255;
+                          payload.failNoiseCount = 0;
                           break;  
                       }
                       // Serial.println("Unknown Command");
@@ -156,6 +158,7 @@ static byte waitForAck(byte t) {
                 // see http://talk.jeelabs.net/topic/811#post-4712
                 if (rf12_hdr == (RF12_HDR_DST | RF12_HDR_CTL | NodeID)) {
                     // Serial.print("ACK ");
+                    payload.rxRssi = rf12_rssi;
                     return 1;            
                 } else {
                     // Serial.print("Unmatched: ");             // Flush the buffer
@@ -271,6 +274,7 @@ static word calcCrc (const void* ptr, byte len) {
 
 void setup() {
   loadSettings();                       // Restore settings from eeprom
+  payload.failNoiseFloor = 255;
 
   rf12_initialize(NodeID,freq,network); // Initialize RFM12 with settings defined above 
   RF69::control(0x91, ((settings.txPower & 31) | 0x80)); // pa0 assumed
@@ -342,9 +346,12 @@ void loop() {
 
   payload.goodNoiseFloor = rf12_canSend(settings.txAllowThreshold);
   if(payload.goodNoiseFloor) sendACK();
-  else payload.failNoiseFloor = payload.goodNoiseFloor; 
+  else if (RF69::sendRSSI < payload.failNoiseFloor){
+    payload.failNoiseFloor = RF69::sendRSSI; 
+    payload.failNoiseCount++;
+  }
   
-  if(!(commandResponse)) Sleepy::loseSomeTime(60000);
+  if(!(commandResponse)) Sleepy::loseSomeTime(54000);
   else Sleepy::loseSomeTime((1000));
 
 }
