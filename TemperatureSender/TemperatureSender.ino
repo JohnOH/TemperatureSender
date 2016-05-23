@@ -37,13 +37,13 @@ ISR(WDT_vect) { Sleepy::watchdogEvent(); } // interrupt handler for JeeLabs Slee
 #define ONE_WIRE_BUS 10   // DS18B20 Temperature sensor is connected on D10/ATtiny pin 13
 #define ONE_WIRE_POWER 9  // DS18B20 Power pin is connected on D9/ATtiny pin 12
 
-#define BASIC_PAYLOAD_SIZE 11
+#define BASIC_PAYLOAD_SIZE 13
 byte payloadSize = BASIC_PAYLOAD_SIZE;
 byte commandResponse = false;
 
 OneWire ds(ONE_WIRE_BUS); // Setup a oneWire instance
 
-//DallasTemperature sensors(&oneWire); // Pass our oneWire reference to Dallas Temperature
+// DallasTemperature sensors(&oneWire); // Pass our oneWire reference to Dallas Temperature
 
 typedef struct {
       byte command;         // Last command received in ACK
@@ -52,9 +52,10 @@ typedef struct {
       byte attempts: 4;     // transmission attempts
       byte count: 4;        // packet count
       byte goodNoiseFloor;  // Noise floor allowed transmit
-      byte failNoiseFloor;  // Noise floor prevention transmit
+      byte failNoiseFloor;  // Noise floor preventing transmit
       byte failNoiseCount;
       byte rxRssi;          // RSSI of received ACK's
+      signed int rxFei;     
       unsigned int temp;    // Temperature reading
       unsigned int supplyV; // Supply voltage
       char messages[64 - BASIC_PAYLOAD_SIZE];
@@ -70,76 +71,81 @@ typedef struct {
 static eeprom settings;
 
 static byte sendACK() {
-  payload.count++;
-  for (byte t = 1; t <= RETRY_LIMIT; t++) {  
-      delay(t * t);                   // Increasing the gap between retransmissions
-      payload.attempts = t;
-      rf12_sleep(RF12_WAKEUP);
-      if (rf12_recvDone()) {
-          // Serial.print("Discarded: ");             // Flush the buffer
-          for (byte i = 0; i < 8; i++) {
-              showByte(rf12_buf[i]);
-              rf12_buf[i] = 0xFF;                     // Paint it over
-              printOneChar(' ');
-          }
-          // Serial.println();
-          // Serial.flush(); 
-      }
-      rf12_sendStart(RF12_HDR_ACK, &payload, payloadSize);
-      byte acked = waitForAck(t * t); // Wait for increasingly longer time for the ACK
-      if (acked) {
-          payloadSize = BASIC_PAYLOAD_SIZE;   // Packet was ACK'ed by someone
-          commandResponse = false;
-          payload.packetType = 0;                         
-          for (byte i = 0; i < 6; i++) {
-              showByte(rf12_buf[i]);
-              printOneChar(' ');
-          }
-          // Serial.println();
-          if (rf12_buf[2] > 0) {                          // Non-zero length ACK packet?
-              payload.packetType = 1;                         
-              payload.command = rf12_buf[3];
-              // Serial.print("Command=");
-              // Serial.println(rf12_buf[3]);
-              commandResponse = true;
-
-              if ((rf12_len + 5) > sizeof payload.messages) rf12_len = (sizeof payload.messages - 5); 
-              for (byte i = 0; i < (rf12_len + 5); i++) {
-                  payload.messages [i] = rf12_buf[i];     // Return command stream with next packet
-                  payloadSize = BASIC_PAYLOAD_SIZE + (rf12_len + 5);
+  payload.goodNoiseFloor = rf12_canSend(settings.txAllowThreshold);
+  if (payload.goodNoiseFloor) {  
+      payload.count++;
+      for (byte t = 1; t <= RETRY_LIMIT; t++) {  
+          delay(t * t);                   // Increasing the gap between retransmissions
+          payload.attempts = t;
+          rf12_sleep(RF12_WAKEUP);
+          byte payload.goodNoiseFloor = rf12_canSend(settings.txAllowThreshold);   // -80dB
+          if (rf12_recvDone()) {
+              // Serial.print("Discarded: ");             // Flush the buffer
+              for (byte i = 0; i < 8; i++) {
+                  showByte(rf12_buf[i]);
+                  rf12_buf[i] = 0xFF;                     // Paint it over
+                  printOneChar(' ');
               }
+              // Serial.println();
+              // Serial.flush(); 
+          }
+      
+          rf12_sendStart(RF12_HDR_ACK, &payload, payloadSize);
+          byte acked = waitForAck(t * t); // Wait for increasingly longer time for the ACK
+          if (acked) {
+              payloadSize = BASIC_PAYLOAD_SIZE;   // Packet was ACK'ed by someone
+              commandResponse = false;
+              payload.packetType = 0;                         
+              for (byte i = 0; i < 6; i++) {
+                  showByte(rf12_buf[i]);
+                  printOneChar(' ');
+              }
+              // Serial.println();
+              if (rf12_buf[2] > 0) {                          // Non-zero length ACK packet?
+                  payload.packetType = 1;                         
+                  payload.command = rf12_buf[3];
+                  // Serial.print("Command=");
+                  // Serial.println(rf12_buf[3]);
+                  commandResponse = true;
+
+                  if ((rf12_len + 5) > sizeof payload.messages) rf12_len = (sizeof payload.messages - 5); 
+                  for (byte i = 0; i < (rf12_len + 5); i++) {
+                      payload.messages [i] = rf12_buf[i];     // Return command stream with next packet
+                      payloadSize = BASIC_PAYLOAD_SIZE + (rf12_len + 5);
+                  }
               
-              switch (rf12_buf[3]) {
-                  case 1: // Increase transmit power by 1dB
-                      (++settings.txPower) & 31;
-                      RF69::control(0x91, (settings.txPower | 0x80)); // pa0 assumed
-                      break;
-                  case 2: // Reduce transmit power by 1dB
-                      (--settings.txPower) & 31;
-                      RF69::control(0x91, (settings.txPower | 0x80)); // pa0 assumed
-                      break;
-                  case 99:
-                      // Serial.println("Saving settings to eeprom");
-                      saveSettings();
-                      break;      
-                  default:
-                      if (rf12_buf[3] > 0 && rf12_buf[3] < 32) {
-                          settings.txPower = rf12_buf[3] & 31;
+                  switch (rf12_buf[3]) {
+                      case 1: // Increase transmit power by 1dB
+                          (++settings.txPower) & 31;
                           RF69::control(0x91, (settings.txPower | 0x80)); // pa0 assumed
                           break;
-                      }
-                      if (rf12_buf[3] > 99 && rf12_buf[3] < 255) {
-                          settings.txAllowThreshold = rf12_buf[3];
-                          payload.failNoiseFloor = 255;
-                          payload.failNoiseCount = 0;
-                          break;  
-                      }
-                      // Serial.println("Unknown Command");
-                      break;
+                      case 2: // Reduce transmit power by 1dB
+                          (--settings.txPower) & 31;
+                          RF69::control(0x91, (settings.txPower | 0x80)); // pa0 assumed
+                          break;
+                      case 99:
+                          // Serial.println("Saving settings to eeprom");
+                          saveSettings();
+                          break;      
+                      default:
+                          if (rf12_buf[3] > 2 && rf12_buf[3] < 32) {
+                              settings.txPower = rf12_buf[3] & 31;
+                              RF69::control(0x91, (settings.txPower | 0x80)); // pa0 assumed
+                              break;
+                          }
+                          if (rf12_buf[3] > 99 && rf12_buf[3] < 255) {
+                              settings.txAllowThreshold = rf12_buf[3];
+                              payload.failNoiseFloor = 255;
+                              payload.failNoiseCount = 0;
+                              break;  
+                          }
+                          // Serial.println("Unknown Command");
+                          break;
 
-                  } // end switch
-          }
-          return t;
+                      } // end switch
+              } // rf12_buf[2]
+              return t;
+          } // acked
       }
   }
   return 0;
@@ -159,9 +165,10 @@ static byte waitForAck(byte t) {
                 if (rf12_hdr == (RF12_HDR_DST | RF12_HDR_CTL | NodeID)) {
                     // Serial.print("ACK ");
                     payload.rxRssi = rf12_rssi;
+                    payload.rxFei = rf12_fei;
                     return 1;            
                 } else {
-                    // Serial.print("Unmatched: ");             // Flush the buffer
+                    // Serial.print("Unmatched: ");      // Flush the buffer
                     for (byte i = 0; i < 8; i++) {;
                         showByte(rf12_buf[i]);
                         rf12_buf[i] = 0xFF;              // Paint it over
@@ -344,12 +351,7 @@ void loop() {
   
   payload.supplyV = readVcc(); // Get supply voltage
 
-  payload.goodNoiseFloor = rf12_canSend(settings.txAllowThreshold);
-  if(payload.goodNoiseFloor) sendACK();
-  else if (RF69::sendRSSI < payload.failNoiseFloor){
-    payload.failNoiseFloor = RF69::sendRSSI; 
-    payload.failNoiseCount++;
-  }
+  sendACK();
   
   if(!(commandResponse)) Sleepy::loseSomeTime(54000);
   else Sleepy::loseSomeTime((1000));
