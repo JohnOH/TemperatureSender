@@ -28,16 +28,16 @@
 ISR(WDT_vect) { Sleepy::watchdogEvent(); } // interrupt handler for JeeLabs Sleepy power saving
 
 #define NodeID 4          // RF12 node ID in the range 1-30
-#define network 212       // RF12 Network group
-#define freq RF12_868MHZ  // Frequency of RFM69CW module
+#define group 212       // RF12 Network group
+#define band RF12_868MHZ  // Band of RFM69CW module
 
-#define ACK_TIME        100  // number of milliseconds - to wait for an ack, an initial 100ms
-#define RETRY_LIMIT      7
+#define ACK_TIME         20  // number of milliseconds - to wait for an ack
+#define RETRY_LIMIT      1
 
 #define ONE_WIRE_BUS 10   // DS18B20 Temperature sensor is connected on D10/ATtiny pin 13
 #define ONE_WIRE_POWER 9  // DS18B20 Power pin is connected on D9/ATtiny pin 12
 
-#define BASIC_PAYLOAD_SIZE 13
+#define BASIC_PAYLOAD_SIZE 14
 byte payloadSize = BASIC_PAYLOAD_SIZE;
 byte commandResponse = false;
 
@@ -65,20 +65,20 @@ typedef struct {
 typedef struct {
     byte start;
     byte txAllowThreshold;
-    byte txPower;    
+    byte txPower;
+    byte rssiThreshold;    
     word crc;
 } eeprom;
 static eeprom settings;
 
 static byte sendACK() {
-  payload.goodNoiseFloor = rf12_canSend(settings.txAllowThreshold);
-  if (payload.goodNoiseFloor) {  
       payload.count++;
       for (byte t = 1; t <= RETRY_LIMIT; t++) {  
-          delay(t * t);                   // Increasing the gap between retransmissions
+          delay(t * 10);                   // Increasing the gap between retransmissions
           payload.attempts = t;
           rf12_sleep(RF12_WAKEUP);
-          byte payload.goodNoiseFloor = rf12_canSend(settings.txAllowThreshold);   // -80dB
+          
+          RF69::rssiThreshold = settings.rssiThreshold;
           if (rf12_recvDone()) {
               // Serial.print("Discarded: ");             // Flush the buffer
               for (byte i = 0; i < 8; i++) {
@@ -89,10 +89,22 @@ static byte sendACK() {
               // Serial.println();
               // Serial.flush(); 
           }
-      
+
+
+          while (!(rf12_canSend())) {
+            // Serial.print("Airwaves Busy");
+            Sleepy::loseSomeTime((50)); 
+          }
+          
+          // Serial.println("TX Start");
+          // Serial.flush();
           rf12_sendStart(RF12_HDR_ACK, &payload, payloadSize);
-          byte acked = waitForAck(t * t); // Wait for increasingly longer time for the ACK
+          rf12_sendWait(1);
+          rf12_recvDone();
+          byte acked = waitForAck(t); // Wait for increasingly longer time for the ACK
           if (acked) {
+              payload.rxRssi = rf12_rssi;
+              payload.rxFei = rf12_fei;
               payloadSize = BASIC_PAYLOAD_SIZE;   // Packet was ACK'ed by someone
               commandResponse = false;
               payload.packetType = 0;                         
@@ -100,9 +112,14 @@ static byte sendACK() {
                   showByte(rf12_buf[i]);
                   printOneChar(' ');
               }
-              // Serial.println();
+              // Serial.print("RX threshold:");
+              // Serial.println(RF69::rssiThreshold);
               if (rf12_buf[2] > 0) {                          // Non-zero length ACK packet?
-                  payload.packetType = 1;                         
+                  payload.packetType = 1;
+                  if (payload.command == rf12_buf[3]) {
+                      payload.command = 0;
+                      return t;                         
+                  }
                   payload.command = rf12_buf[3];
                   // Serial.print("Command=");
                   // Serial.println(rf12_buf[3]);
@@ -123,12 +140,18 @@ static byte sendACK() {
                           (--settings.txPower) & 31;
                           RF69::control(0x91, (settings.txPower | 0x80)); // pa0 assumed
                           break;
+                      case 3: // Increase RX threshold by 0.5dB
+                          (++settings.rssiThreshold);
+                          break;
+                      case 4: // Reduce RX threshold by 0.5dB
+                          (--settings.rssiThreshold);
+                          break;
                       case 99:
                           // Serial.println("Saving settings to eeprom");
                           saveSettings();
                           break;      
                       default:
-                          if (rf12_buf[3] > 2 && rf12_buf[3] < 32) {
+                          if (rf12_buf[3] > 4 && rf12_buf[3] < 32) {
                               settings.txPower = rf12_buf[3] & 31;
                               RF69::control(0x91, (settings.txPower | 0x80)); // pa0 assumed
                               break;
@@ -147,7 +170,6 @@ static byte sendACK() {
               return t;
           } // acked
       }
-  }
   return 0;
 } // sendACK
 
@@ -156,20 +178,17 @@ static byte waitForAck(byte t) {
     while (!ackTimer.poll(ACK_TIME + t)) {
         if (rf12_recvDone()) {
             rf12_sleep(RF12_SLEEP);
-
             // Serial.print((ACK_TIME + t) - ackTimer.remaining());
             // Serial.print("ms RX ");
             
             if (rf12_crc == 0) {                          // Valid packet?
                 // see http://talk.jeelabs.net/topic/811#post-4712
-                if (rf12_hdr == (RF12_HDR_DST | RF12_HDR_CTL | NodeID)) {
+                if (rf12_hdr == (/*RF12_HDR_DST*/ 0x40 | RF12_HDR_CTL | NodeID)) {
                     // Serial.print("ACK ");
-                    payload.rxRssi = rf12_rssi;
-                    payload.rxFei = rf12_fei;
                     return 1;            
                 } else {
                     // Serial.print("Unmatched: ");      // Flush the buffer
-                    for (byte i = 0; i < 8; i++) {;
+                    for (byte i = 0; i < 8; i++) {
                         showByte(rf12_buf[i]);
                         rf12_buf[i] = 0xFF;              // Paint it over
                         printOneChar(' ');
@@ -180,14 +199,16 @@ static byte waitForAck(byte t) {
                 payload.badCRC++;
             }
             // Serial.println(); // Serial.flush();           
-        } 
-        set_sleep_mode(SLEEP_MODE_IDLE);   // Wait a while for the reply?
-        sleep_mode();
+        }
+//        set_sleep_mode(SLEEP_MODE_IDLE);   // Wait a while for the reply?
+//        sleep_mode();
     }
 //    printOneChar(' ');
+
     // Serial.print(ACK_TIME + t);
-    // Serial.println("ms ACK Timeout");
+    // Serial.println("ms, Timeout");
     // Serial.flush();
+
     return 0;
 } // waitForAck
 
@@ -234,7 +255,7 @@ static void loadSettings () {
     uint16_t crc = ~0;
     // eeprom_read_block(&settings, SETTINGS_EEPROM_ADDR, sizeof settings);
     // this uses 166 bytes less flash than eeprom_read_block(), no idea why
-    for (byte i = 0; i < sizeof settings; ++i) {
+    for (byte i = 0; i < sizeof settings; i++) {
         ((byte*) &settings)[i] = eeprom_read_byte(SETTINGS_EEPROM_ADDR + i);
         crc = crc_update(crc, ((byte*) &settings)[i]);
     }
@@ -242,8 +263,9 @@ static void loadSettings () {
     if (crc) {
         // Serial.println("is bad, defaulting");
         // Serial.println(crc, HEX);
-        settings.txAllowThreshold = 170;    // Default to -85dB transmit permit threshold
-        settings.txPower = 31;              // Maximum TX power
+        settings.txAllowThreshold = 160;    // Default to -80dB transmit permit threshold
+        settings.txPower = 22;              // TX power
+        settings.rssiThreshold = 200;         // RX Threshold
     } else {
         // Serial.println("is good");
     }
@@ -280,16 +302,21 @@ static word calcCrc (const void* ptr, byte len) {
 //########################################################################################################################
 
 void setup() {
+  delay(100);          // Delay on startup to avoid ISP/RFM12B interference.
+  // Serial.begin(115200);
+  // Serial.println("115200");
+  
   loadSettings();                       // Restore settings from eeprom
   payload.failNoiseFloor = 255;
 
-  rf12_initialize(NodeID,freq,network); // Initialize RFM12 with settings defined above 
+  rf12_initialize(NodeID, band, group, 1600); // Initialize RFM12 with settings defined above 
   RF69::control(0x91, ((settings.txPower & 31) | 0x80)); // pa0 assumed
-  rf12_sleep(0);                        // Put the RFM12 to sleep
+  rf12_sleep(RF12_SLEEP);                        // Put the RFM12 to sleep
 
-  pinMode(ONE_WIRE_POWER, OUTPUT);      // set power pin for DS18B20 to output
-  digitalWrite(ONE_WIRE_POWER, HIGH);   // Power up the DS18B20
+//  pinMode(ONE_WIRE_POWER, OUTPUT);      // set power pin for DS18B20 to output
+//  digitalWrite(ONE_WIRE_POWER, HIGH);   // Power up the DS18B20
   Sleepy::loseSomeTime((100 + 16));
+  // Serial.flush();
  
   PRR = bit(PRTIM1); // only keep timer 0 going
   
@@ -350,10 +377,11 @@ void loop() {
   digitalWrite(ONE_WIRE_POWER, LOW); // turn DS18B20 off
   
   payload.supplyV = readVcc(); // Get supply voltage
-
+  // Serial.print("Voltage=");
+  // Serial.println(payload.supplyV);
   sendACK();
-  
-  if(!(commandResponse)) Sleepy::loseSomeTime(54000);
+  // Serial.flush();
+  if(!(commandResponse)) Sleepy::loseSomeTime(59000);
   else Sleepy::loseSomeTime((1000));
 
 }
