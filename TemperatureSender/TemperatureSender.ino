@@ -27,7 +27,7 @@
 
 ISR(WDT_vect) { Sleepy::watchdogEvent(); } // interrupt handler for JeeLabs Sleepy power saving
 
-#define NodeID 4          // RF12 node ID in the range 1-30
+#define NodeID 4        // RF12 node ID in the range 1-30
 #define group 212       // RF12 Network group
 #define band RF12_868MHZ  // Band of RFM69CW module
 
@@ -37,7 +37,7 @@ ISR(WDT_vect) { Sleepy::watchdogEvent(); } // interrupt handler for JeeLabs Slee
 #define ONE_WIRE_BUS 10   // DS18B20 Temperature sensor is connected on D10/ATtiny pin 13
 #define ONE_WIRE_POWER 9  // DS18B20 Power pin is connected on D9/ATtiny pin 12
 
-#define BASIC_PAYLOAD_SIZE 14
+#define BASIC_PAYLOAD_SIZE 13
 byte payloadSize = BASIC_PAYLOAD_SIZE;
 byte commandResponse = false;
 
@@ -46,18 +46,18 @@ OneWire ds(ONE_WIRE_BUS); // Setup a oneWire instance
 // DallasTemperature sensors(&oneWire); // Pass our oneWire reference to Dallas Temperature
 
 typedef struct {
-      byte command;         // Last command received in ACK
-      byte badCRC:  4;      // Running count of CRC mismatches
-      byte packetType:  4;  // High order packet type bits
-      byte attempts: 4;     // transmission attempts
-      byte count: 4;        // packet count
-      byte goodNoiseFloor;  // Noise floor allowed transmit
-      byte failNoiseFloor;  // Noise floor preventing transmit
-      byte failNoiseCount;
-      byte rxRssi;          // RSSI of received ACK's
-      signed int rxFei;     
-      unsigned int temp;    // Temperature reading
-      unsigned int supplyV; // Supply voltage
+      byte command;         // (1)Last command received in ACK
+      byte badCRC:  4;      // (2)Running count of CRC mismatches
+      byte packetType:  4;  // (2)High order packet type bits
+      byte attempts: 4;     // (3)transmission attempts
+      byte count: 4;        // (3)packet count
+      byte noiseFloor;      // (4)Noise floor just before TX initiated
+      byte failNoiseFloor;  // (5)Noise floor preventing transmit
+      byte failNoiseCount;	// (6)
+      byte rxRssi;          // (7)RSSI of received ACK's
+      signed int rxFei;     // (9 & 8)
+      unsigned int temp;    // (11 & 10)Temperature reading
+      unsigned int supplyV; // (13 & 12)Supply voltage
       char messages[64 - BASIC_PAYLOAD_SIZE];
  } packet;
  static packet payload;
@@ -91,9 +91,12 @@ static byte sendACK() {
           }
 
 
-          while (!(rf12_canSend())) {
+          payload.noiseFloor = rf12_canSend(settings.txAllowThreshold);
+          if (!(payload.noiseFloor)) {
             // Serial.print("Airwaves Busy");
-            Sleepy::loseSomeTime((50)); 
+            payload.failNoiseFloor = RF69::sendRSSI;
+            payload.failNoiseCount++;
+            return 0; // Abandon transmission
           }
           
           // Serial.println("TX Start");
@@ -313,8 +316,8 @@ void setup() {
   RF69::control(0x91, ((settings.txPower & 31) | 0x80)); // pa0 assumed
   rf12_sleep(RF12_SLEEP);                        // Put the RFM12 to sleep
 
-//  pinMode(ONE_WIRE_POWER, OUTPUT);      // set power pin for DS18B20 to output
-//  digitalWrite(ONE_WIRE_POWER, HIGH);   // Power up the DS18B20
+  pinMode(ONE_WIRE_POWER, OUTPUT);      // set power pin for DS18B20 to output
+  digitalWrite(ONE_WIRE_POWER, HIGH);   // Power up the DS18B20
   Sleepy::loseSomeTime((100 + 16));
   // Serial.flush();
  
@@ -337,8 +340,9 @@ void setup() {
   ds.skip();                // Next command to all devices
   ds.write(0x48);           // Set Config
   Sleepy::loseSomeTime((100 + 16));// Wait for copy to complete
-//  digitalWrite(ONE_WIRE_POWER, LOW);    // Power down the DS18B20    
 */
+  digitalWrite(ONE_WIRE_POWER, LOW);    // Power down the DS18B20    
+
 }
 
 unsigned int getTemp(byte* sensor) {
@@ -363,6 +367,7 @@ unsigned int getTemp(byte* sensor) {
   return (raw); // return t*100
 }
 
+unsigned int previousTemp = 65535;
 void loop() {
   
   digitalWrite(ONE_WIRE_POWER, HIGH); // turn DS18B20 sensor on
@@ -372,15 +377,16 @@ void loop() {
   ds.write(0x44);                                           // Start all temperature conversions.
   Sleepy::loseSomeTime((750));                              // Wait for the data to be available
 
-  unsigned int temp = getTemp(0);
-  payload.temp = temp;
+  payload.temp = getTemp(0);
   digitalWrite(ONE_WIRE_POWER, LOW); // turn DS18B20 off
-  
-  payload.supplyV = readVcc(); // Get supply voltage
-  // Serial.print("Voltage=");
-  // Serial.println(payload.supplyV);
-  sendACK();
-  // Serial.flush();
+  if(payload.temp != previousTemp){
+      previousTemp = payload.temp; 
+      payload.supplyV = readVcc(); // Get supply voltage
+      // Serial.print("Voltage=");
+      // Serial.println(payload.supplyV);
+      sendACK();
+      // Serial.flush();
+  }
   if(!(commandResponse)) Sleepy::loseSomeTime(59000);
   else Sleepy::loseSomeTime((1000));
 
