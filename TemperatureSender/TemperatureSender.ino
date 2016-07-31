@@ -32,7 +32,7 @@ ISR(WDT_vect) { Sleepy::watchdogEvent(); } // interrupt handler for JeeLabs Slee
 #define band RF12_868MHZ  // Band of RFM69CW module
 
 #define ACK_TIME         20  // number of milliseconds - to wait for an ack
-#define RETRY_LIMIT      1
+#define RETRY_LIMIT      1   // Retransmission isn't used, used for command stream only
 
 #define ONE_WIRE_BUS 10   // DS18B20 Temperature sensor is connected on D10/ATtiny pin 13
 #define ONE_WIRE_POWER 9  // DS18B20 Power pin is connected on D9/ATtiny pin 12
@@ -103,7 +103,6 @@ static byte sendACK() {
           // Serial.flush();
           rf12_sendStart(RF12_HDR_ACK, &payload, payloadSize);
           rf12_sendWait(1);
-          rf12_recvDone();
           byte acked = waitForAck(t); // Wait for increasingly longer time for the ACK
           if (acked) {
               payload.rxRssi = rf12_rssi;
@@ -171,6 +170,9 @@ static byte sendACK() {
                       } // end switch
               } // rf12_buf[2]
               return t;
+          } else {
+              payload.rxRssi = 0;
+              payload.rxFei = 0;            
           } // acked
       }
   return 0;
@@ -377,15 +379,16 @@ void loop() {
   ds.write(0x44);                                           // Start all temperature conversions.
   Sleepy::loseSomeTime((750));                              // Wait for the data to be available
 
-  payload.temp = getTemp(0);
+  unsigned int temp = getTemp(0);
+  payload.temp = temp;
   digitalWrite(ONE_WIRE_POWER, LOW); // turn DS18B20 off
-  if(payload.temp != previousTemp){
-      previousTemp = payload.temp; 
-      payload.supplyV = readVcc(); // Get supply voltage
+  if(temp != previousTemp){
+      previousTemp = temp; 
+      payload.supplyV = readVcc();  // Get supply voltage
       // Serial.print("Voltage=");
       // Serial.println(payload.supplyV);
-      sendACK();
       // Serial.flush();
+      sendACK();
   }
   if(!(commandResponse)) Sleepy::loseSomeTime(59000);
   else Sleepy::loseSomeTime((1000));
